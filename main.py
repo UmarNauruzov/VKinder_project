@@ -7,6 +7,7 @@ from vk_api.longpoll import VkLongPoll, VkEventType
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 from vk_api.execute import VkFunction
 from database import Session, App_User, Results
+from vk_api.exceptions import VkApiError
 
 
 class Bot:
@@ -62,16 +63,19 @@ class Bot:
         return city_existence
 
     def add_city(self, user_text, user_id):
-
-        country_response = self.vk_user.method('database.getCountries', {'count': '1'})
-        country_id = country_response['items'][0]['id']
-
-        line = user_text.split(' ')
-        city_response = self.vk_user.method('database.getCities', {'country_id': country_id, 'count': '1', 'q': line})
-        city_id = city_response['items'][0]['id']
-
-        self.session.query(App_User).filter(App_User.vk_id == user_id).update({"city_id": city_id})
-        self.session.commit()
+        try:
+            country_response = self.vk_user.method('database.getCountries', {'count': '1'})
+            country_id = country_response.get('items', [{}])[0].get('id', None)
+            if country_id is not None:
+                line = user_text.split(' ')
+                city_response = self.vk_user.method('database.getCities',
+                                                    {'country_id': country_id, 'count': '1', 'q': line})
+                city_id = city_response.get('items', [{}])[0].get('id', None)
+                if city_id is not None:
+                    self.session.query(App_User).filter(App_User.vk_id == user_id).update({"city_id": city_id})
+                    self.session.commit()
+        except (KeyError, vk_api.ApiError) as e:
+            print(f"Ошибка при получении данных от сервера: {e}")
 
     def send_text_msg(self, user_id, message):
 
@@ -84,7 +88,88 @@ class Bot:
                   'random_id': randrange(10 ** 7)}
         self.vk_bot.method('messages.send', params)
 
-    def search_people(self, user_id):
+    def pick(self, user_id):
+
+        user_db_id = self.session.query(App_User.id).filter(App_User.vk_id == user_id).scalar()
+        user = self.session.query(App_User).get(user_db_id)
+
+        final_result = []
+        found_count = 0
+        offset = 0
+        limit = 50
+
+        while found_count < 10:
+            try:
+                raw_data = self.search_people(user_id, offset, limit)
+            except KeyError:
+                return "Произошла ошибка при получении результатов поиска."
+
+            for person in raw_data:
+                if found_count >= 10:
+                    break
+
+                if not person['is_closed']:
+                    db_presence = self.session.query(Results.id).join(Results.users). \
+                        filter(App_User.vk_id == user_id, Results.result_vk_id == int(person['id'])).scalar()
+
+                    db_black_list = self.session.query(Results.black_list).join(Results.users). \
+                        filter(App_User.vk_id == user_id, Results.result_vk_id == int(person['id'])).scalar()
+
+                    if db_presence is None and db_black_list is not True:
+
+                        person_info = {}
+                        offset = 0
+                        all_photos = []
+
+                        while True:
+                            try:
+                                photos = self.vk_user.method('photos.get',
+                                                             {'owner_id': person['id'], 'album_id': 'profile',
+                                                              'extended': '1', 'count': '1000',
+                                                              'offset': offset, 'v': '5.130'})
+                            except KeyError:
+                                return "Произошла ошибка при извлечении пользовательских фотографий."
+
+                            offset += 1000
+                            if len(photos["items"]) == 0:
+                                break
+                            for photo in photos['items']:
+                                all_photos.append(photo)
+
+                        sorted_photos = sorted(all_photos,
+                                               key=lambda x: x['likes']['count'] + x['comments']['count'], reverse=True)
+                        person_info['url'] = 'https://vk.com/id' + str(person['id'])
+                        if len(sorted_photos) >= 3:
+                            person_info['1'] = sorted_photos[0]['id']
+                            person_info['2'] = sorted_photos[1]['id']
+                            person_info['3'] = sorted_photos[2]['id']
+                        elif len(sorted_photos) == 2:
+                            person_info['1'] = sorted_photos[0]['id']
+                            person_info['2'] = sorted_photos[1]['id']
+                        elif len(sorted_photos) == 1:
+                            person_info['1'] = sorted_photos[0]['id']
+                        final_result.append(person_info)
+
+                        if person_info.get('1') is not None:
+                            result = Results(result_vk_id=int(person['id']), url=person_info['url'],
+                                             photo_id=sorted_photos[0]['id'])
+                            self.session.add(result)
+                            result.users.append(user)
+                            self.session.commit()
+                        else:
+                            result = Results(result_vk_id=int(person['id']), url=person_info['url'])
+                            self.session.add(result)
+                            result.users.append(user)
+                            self.session.commit()
+
+                        found_count += 1
+
+            offset += 50
+
+        with open("test/created files/pairs.json", "w", encoding='UTF-8') as f:
+            json.dump(final_result, f, ensure_ascii=False, indent=4)
+
+    def search_people(self, user_id, offset, limit):
 
         if self.check_data(user_id):
             age = int(time.ctime().split(' ')[4]) - \
@@ -99,7 +184,7 @@ class Bot:
             age_from = age - 2
             age_to = age + 2
 
-            massive_search = VkFunction(args=('city_id', 'gender', 'age_from', 'age_to'), code=''' 
+            massive_search = VkFunction(args=('city_id', 'gender', 'age_from', 'age_to', 'offset', 'limit'), code=''' 
             var birth_month = 1;
             var relation = 1;
             var people = API.users.search({'city': (%(city_id)s), 'sex': (%(gender)s), 'age_from': (%(age_from)s), 
@@ -122,17 +207,24 @@ class Bot:
             return people;
             ''')
 
-            response = self.vk_user.method('users.get', {'user_ids': user_id, 'fields':
-                ['interests, music, tv, books, games, bdate']})
-            user_data = response[0]
-            user_interests = user_data.get('interests')
-            user_music = user_data.get('music')
-            user_tv = user_data.get('tv')
-            user_books = user_data.get('books')
-            user_games = user_data.get('games')
-            user_birth_year = user_data.get('bdate')
+            try:
+                response = self.vk_user.method('users.get', dict(user_ids=user_id,
+                                                                 fields=['interests, music, tv, books, games, bdate']))
+                user_data = response[0]
+                user_interests = user_data.get('interests')
+                user_music = user_data.get('music')
+                user_tv = user_data.get('tv')
+                user_books = user_data.get('books')
+                user_games = user_data.get('games')
+                user_birth_year = user_data.get('bdate')
+            except KeyError:
+                return "Произошла ошибка при извлечении пользовательских данных."
 
-            data = massive_search(self.vk_user, city_id, gender, age_from, age_to)
+            try:
+                data = massive_search(self.vk_user, city_id, gender, age_from, age_to, offset, limit)
+            except KeyError:
+                return "Произошла ошибка при получении результатов поиска."
+
             for result in data:
                 result['value'] = 0
 
@@ -180,78 +272,15 @@ class Bot:
 
             return sorted_data
 
-    def pick(self, user_id):
-
-        raw_data = self.search_people(user_id)
-        final_result = []
-
-        user_db_id = self.session.query(App_User.id).filter(App_User.vk_id == user_id).scalar()
-        user = self.session.query(App_User).get(user_db_id)
-
-        for person in raw_data:
-
-            if not person['is_closed']:
-                db_presence = self.session.query(Results.id).join(Results.users). \
-                    filter(App_User.vk_id == user_id, Results.result_vk_id == int(person['id'])).scalar()
-
-                db_black_list = self.session.query(Results.black_list).join(Results.users). \
-                    filter(App_User.vk_id == user_id, Results.result_vk_id == int(person['id'])).scalar()
-
-                if db_presence is None and db_black_list is not True:
-
-                    person_info = {}
-                    offset = 0
-                    all_photos = []
-
-                    while True:
-                        photos = self.vk_user.method('photos.get', {'owner_id': person['id'], 'album_id': 'profile',
-                                                                    'extended': '1', 'count': '1000',
-                                                                    'offset': offset, 'v': '5.130'})
-                        offset += 1000
-                        if len(photos["items"]) == 0:
-                            break
-                        for photo in photos['items']:
-                            all_photos.append(photo)
-
-                    sorted_photos = sorted(all_photos,
-                                           key=lambda x: x['likes']['count'] + x['comments']['count'], reverse=True)
-                    person_info['url'] = 'https://vk.com/id' + str(person['id'])
-                    if len(sorted_photos) >= 3:
-                        person_info['1'] = sorted_photos[0]['id']
-                        person_info['2'] = sorted_photos[1]['id']
-                        person_info['3'] = sorted_photos[2]['id']
-                    elif len(sorted_photos) == 2:
-                        person_info['1'] = sorted_photos[0]['id']
-                        person_info['2'] = sorted_photos[1]['id']
-                    elif len(sorted_photos) == 1:
-                        person_info['1'] = sorted_photos[0]['id']
-                    final_result.append(person_info)
-
-                    if person_info.get('1') is not None:
-                        result = Results(result_vk_id=int(person['id']), url=person_info['url'],
-                                         photo_id=sorted_photos[0]['id'])
-                        self.session.add(result)
-                        result.users.append(user)
-                        self.session.commit()
-                    else:
-                        result = Results(result_vk_id=int(person['id']), url=person_info['url'])
-                        self.session.add(result)
-                        result.users.append(user)
-                        self.session.commit()
-                    if len(final_result) == 10:
-                        break
-
-        with open("test/created files/pairs.json", "w", encoding='UTF-8') as f:
-            json.dump(final_result, f, ensure_ascii=False, indent=4)
-
     def send_result(self, user_id):
-
-        with open("test/created files/pairs.json", "r", encoding='UTF-8') as f:
-            results = json.load(f)
+        try:
+            with open("test/created files/pairs.json", "r", encoding='UTF-8') as f:
+                results = json.load(f)
+        except FileNotFoundError:
+            results = []
 
         if len(results) == 0:
             self.send_text_msg(user_id, 'Результаты отсутствуют, нажмите "Стоп"')
-
             return
 
         result = results.pop(0)
@@ -272,9 +301,11 @@ class Bot:
         self.vk_bot.method('messages.send', params)
 
     def like(self, user_id, photo_number: str, remove=False):
-
-        with open("test/created files/last_result.json", "r", encoding='UTF-8') as f:
-            info = json.load(f)
+        try:
+            with open("test/created files/last_result.json", "r", encoding='UTF-8') as f:
+                info = json.load(f)
+        except FileNotFoundError:
+            info = {}
 
         photo_id = info.get(photo_number)
         page_id = info.get('url')[17:]
@@ -292,9 +323,11 @@ class Bot:
                 self.main_keys.get_keyboard()
 
     def set_result(self, user_id, favorite=None, black_list=None):
-
-        with open("test/created files/last_result.json", "r", encoding='UTF-8') as f:
-            info = json.load(f)
+        try:
+            with open("test/created files/last_result.json", "r", encoding='UTF-8') as f:
+                info = json.load(f)
+        except FileNotFoundError:
+            info = {}
 
         favorite_url = info.get('url')
         favorite_id = self.session.query(Results.id).join(Results.users). \
@@ -313,83 +346,97 @@ class Bot:
             self.main_keys.get_keyboard()
 
     def show_favorites(self, user_id):
+        offset = 0
+        limit = 10
 
-        favorites = self.session.query(Results).join(Results.users). \
-            filter(App_User.vk_id == user_id, Results.favorite == True).all()
+        while True:
+            try:
+                favorites = self.session.query(Results).join(Results.users). \
+                    filter(App_User.vk_id == user_id, Results.favorite == True).offset(offset).limit(limit).all()
+            except Exception as e:
+                favorites = None
 
-        if favorites is not None:
-            for favorite in favorites:
-                photo = 'photo' + favorite.url[17:] + '_' + str(favorite.photo_id)
-                params = {'user_id': user_id, 'message': favorite.url, 'attachment': f'{photo}',
-                          'random_id': randrange(10 ** 7)}
-                self.vk_bot.method('messages.send', params)
+            if favorites is not None:
+                for favorite in favorites:
+                    photo = 'photo' + favorite.url[17:] + '_' + str(favorite.photo_id)
+                    params = {'user_id': user_id, 'message': favorite.url, 'attachment': f'{photo}',
+                              'random_id': randrange(10 ** 7)}
+                    self.vk_bot.method('messages.send', params)
+                    self.searching_key.get_keyboard()
+                offset += limit
+            else:
+                self.send_text_msg(user_id, 'Список пуст')
                 self.searching_key.get_keyboard()
-        else:
-            self.send_text_msg(user_id, 'Список пуст')
-            self.searching_key.get_keyboard()
+                break
 
     def run(self):
+        try:
+            longpoll = VkLongPoll(self.vk_bot)
+            for event in longpoll.listen():
+                if event.type == VkEventType.MESSAGE_NEW:
+                    if event.to_me:
+                        request = event.text
 
-        longpoll = VkLongPoll(self.vk_bot)
-        for event in longpoll.listen():
-            if event.type == VkEventType.MESSAGE_NEW:
-                if event.to_me:
-                    request = event.text
+                        if "Город - " in request:
+                            self.add_city(request, event.user_id)
+                            self.send_keyboard(event.user_id, 'Город изменён.', self.searching_key.get_keyboard())
 
-                    if "Город - " in request:
-                        self.add_city(request, event.user_id)
-                        self.send_keyboard(event.user_id, 'Город изменён.', self.searching_key.get_keyboard())
+                        elif request == "Поиск":
+                            self.send_text_msg(event.user_id, 'Ожидайте...')
+                            self.check_data(event.user_id)
+                            self.pick(event.user_id)
+                            self.send_keyboard(event.user_id, 'Результат поиска:', self.main_keys.get_keyboard())
+                            self.send_result(event.user_id)
 
-                    elif request == "Поиск":
-                        self.send_text_msg(event.user_id, 'Ожидайте...')
-                        self.check_data(event.user_id)
-                        self.pick(event.user_id)
-                        self.send_keyboard(event.user_id, 'Результат поиска:', self.main_keys.get_keyboard())
-                        self.send_result(event.user_id)
+                        elif request == 'Далее':
+                            self.send_result(event.user_id)
 
-                    elif request == 'Далее':
-                        self.send_result(event.user_id)
+                        elif request == 'Стоп':
+                            self.send_keyboard(event.user_id, 'Текущий поиск завершен', VkKeyboard.get_empty_keyboard())
+                            self.send_keyboard(event.user_id, 'Продолжим', self.searching_key.get_keyboard())
 
-                    elif request == 'Стоп':
-                        self.send_keyboard(event.user_id, 'Текущий поиск завершен', VkKeyboard.get_empty_keyboard())
-                        self.send_keyboard(event.user_id, 'Продолжим', self.searching_key.get_keyboard())
+                        elif request == 'В избранное':
+                            self.set_result(event.user_id, favorite=True)
 
-                    elif request == 'В избранное':
-                        self.set_result(event.user_id, favorite=True)
+                        elif request == 'В черный список':
+                            self.set_result(event.user_id, black_list=True)
 
-                    elif request == 'В черный список':
-                        self.set_result(event.user_id, black_list=True)
+                        elif request == 'Посмотреть избранное':
+                            self.show_favorites(event.user_id)
 
-                    elif request == 'Посмотреть избранное':
-                        self.show_favorites(event.user_id)
+                        elif request == 'Лайк первому фото':
+                            self.like(event.user_id, '1')
+                            self.send_text_msg(event.user_id, 'Поставлен лайк первой фотографии')
 
-                    elif request == 'Лайк первому фото':
-                        self.like(event.user_id, '1')
-                        self.send_text_msg(event.user_id, 'Поставлен лайк первой фотографии')
+                        elif request == 'Лайк второму фото':
+                            self.like(event.user_id, '2')
+                            self.send_text_msg(event.user_id, 'Поставлен лайк второй фотографии')
 
-                    elif request == 'Лайк второму фото':
-                        self.like(event.user_id, '2')
-                        self.send_text_msg(event.user_id, 'Поставлен лайк второй фотографии')
+                        elif request == 'Лайк третьему фото':
+                            self.like(event.user_id, '3')
+                            self.send_text_msg(event.user_id, 'Поставлен лайк третьей фотографии')
 
-                    elif request == 'Лайк третьему фото':
-                        self.like(event.user_id, '3')
-                        self.send_text_msg(event.user_id, 'Поставлен лайк третьей фотографии')
+                        elif request == 'Дизлайк первому фото':
+                            self.like(event.user_id, '1', remove=True)
+                            self.send_text_msg(event.user_id, 'Убран лайк первой фотографии')
 
-                    elif request == 'Дизлайк первому фото':
-                        self.like(event.user_id, '1', remove=True)
-                        self.send_text_msg(event.user_id, 'Убран лайк первой фотографии')
+                        elif request == 'Дизлайк второму фото':
+                            self.like(event.user_id, '2', remove=True)
+                            self.send_text_msg(event.user_id, 'Убран лайк второй фотографии')
 
-                    elif request == 'Дизлайк второму фото':
-                        self.like(event.user_id, '2', remove=True)
-                        self.send_text_msg(event.user_id, 'Убран лайк второй фотографии')
+                        elif request == 'Дизлайк третьему фото':
+                            self.like(event.user_id, '3', remove=True)
+                            self.send_text_msg(event.user_id, 'Убран лайк третьё фотографии')
 
-                    elif request == 'Дизлайк третьему фото':
-                        self.like(event.user_id, '3', remove=True)
-                        self.send_text_msg(event.user_id, 'Убран лайк третьё фотографии')
+                        else:
+                            self.send_keyboard(event.user_id, 'Чтобы начать поиск людей нажмите кнопку "Поиск".\n'
+                                                              'Вам будет доступен результат из 10 или менее человек.\n'
+                                                              'Необходимо уточнить город, для сужения результатов '
+                                                              'поиска людей '
+                                                              'командой "Город - [ Название ]"',
+                                               self.searching_key.get_keyboard())
 
-                    else:
-                        self.send_keyboard(event.user_id, 'Чтобы начать поиск людей нажмите кнопку "Поиск".\n'
-                                                          'Вам будет доступен результат из 10 или менее человек.\n'
-                                                          'Необходимо уточнить город, для сужения результатов поиска людей'
-                                                          'командой "Город - [ Название ]"',
-                                           self.searching_key.get_keyboard())
+        except VkApiError as e:
+            print(f"[ERROR]: {e}")
+        except KeyError as e:
+            print(f"[ERROR]: {e}")
